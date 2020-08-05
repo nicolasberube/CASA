@@ -20,6 +20,7 @@ from bisect import bisect_left, bisect_right
 from gensim.models import Word2Vec
 import multiprocessing
 from sklearn.decomposition import IncrementalPCA
+from googletrans import Translator
 
 
 def progressBar(value, endvalue, bar_length=20):
@@ -130,144 +131,211 @@ def cleanpassage(passage):
     return ' '.join(newpassage.split()).lower()
 
 
-def format_txt(pages_text,
-               dict_words=None,
-               n_ignore=1):
+class text_treatment():
     """
-    Formats a list of strings from pages of a pdf into a list of sentences.
-
-    It will analyze the page breaks with simple regex and identify if a
-    sentence continues on the next page.
-    If that is the case, the sentence will be joined to
-    the previous sentence in the previous page, and treated as if it
-    was written on that page entirely.
-
-    This is because searches on legal documents tend to aim at retrieving
-    sentences/clauses, and therefore the position of the start of the
-    sentence.
+    Functions for text treatment with dictionary filters.
 
     Parameters
     ----------
-    pages_text: list of str
-        List of strings where each string is the text on the page
-        (obtained from pdftotext, for example).
-
-    dict_words: set of str
-        Set of words of the language of the document.
-        Is used for filtering the gibberish from the pdf texts.
-        If None, will not use this functionality.
+    word_dictionaries: dict of str: set of str, optional
+        Each dictionary (in the values of the object) is a set of strings
+        containing all dictionary words for a specific language.
+        Languages are identified by a 2-letters string (in the keys of the
+        object) which are the results of the
+        googletrans.Translator().detect().lang function.
+        Dictionaries are used for filtering the gibberish from the pdf texts
+        and recognize language.
+        If None/empty, will not use those functionalities.
         Default is None.
 
-    n_ignore: int, optional
-        Number of pages to ignore at the start of the pdf.
-        Default is 1 (ignores the cover page).
+    default_lang: str, optional
+        Default language of the dictionaries. Corresponds to a key of the
+        word_dictionaries object to default to if the language
+        recognition fails.
+        If None or empty, no dictionary will be used if the language
+        recognition fails.
+        Default is None.
 
-    Returns
-    -------
-    list of list of str
-        List of the text on the page, where the text is separated
-        into a list of the sentences on the page.
+    Attributes
+    ----------
+    translator:
+        Google api corresponding to the googletrans.Translator() object
+        for language recognition
     """
 
-    if dict_words is None:
-        dict_words = {}
+    def __init__(self,
+                 word_dictionaries=None,
+                 default_lang=None):
+        if word_dictionaries is None:
+            self.word_dictionaries = {}
+        else:
+            self.word_dictionaries = word_dictionaries
+        self.default_lang = default_lang
+        self.translator = Translator()
 
-    data = pages_text + ['.Ending final flag.']
-    # File data that will be returned by the function
-    fdata = []
-    # Page data. fdata will be a list of newpage
-    newpage = []
-    # Sentence data
-    newdat = ''
-    # Flag indicating that we are in a new page
-    newpageflag = False
+    def dictionary_detect(self,
+                          string):
+        """
+        Detect the language of a string of words for dictionary usage.
 
-    # All periods will delimit the end of a sentence
-    # Therefore, the following expressions will be replaced
-    replacelist = {'Mr.': 'Mr',
-                   'Ms.': 'Ms',
-                   'Mrs.': 'Mrs',
-                   'Dr.': 'Dr'}
+        This uses the googletrans.Translator().detect().lang function.
 
-    for pagex in data:
-        page = pagex
-        # Replacement to get rid of periods that aren't at the end of
-        # a sentence
-        for k, v in replacelist.items():
-            page = page.replace(k, v)
+        Parameters
+        ----------
+        string: str
+            string of words to input in
 
-        # This flag will be True at the start of a page is the previous
-        # page was completely empty, therefore, adding an empty page here
-        if newpageflag:
-            fdata.append([])
-        newpageflag = True
-
-        # Iteration over all sentences
-        for datx in page.replace('. ', '.\n').split('\n'):
-            # Gets rids of non-space characters
-            dat = ' '.join(datx.split())
-            # iflag will check if the  sentence contains any real word
-            iflag = False
-            # Gets rid of non-alphanumeric characters for
-            # dictionary analysis
-            for w in re.sub('[^a-zA-Z]+',
-                            ' ',
-                            unidecode(dat)).lower().split():
-                if (not dict_words) or w in dict_words:
-                    iflag = True
-                    break
-
-            # if sentence devoid of true words
-            if not iflag:
-                continue
-
-            # ending  of the previous sentence
-            soft_end = False
-            hard_end = False
-            if len(newdat) > 0:
-                soft_end = newdat[-1].isnumeric() or newdat[-1].isalpha()
-                hard_end = newdat[-1].islower() or newdat[-1] in '-):;,"\''
-            # start of the current sentence
-            soft_start = (dat[0].isalpha() or
-                          dat[0].isnumeric() or
-                          dat[0] in '($"\'')
-            hard_start = dat[0].islower()
-            very_hard_start = (hard_start and
-                               len(dat.split()[0]) > 1 and
-                               dat.split()[0] in dict_words)
-
-            # if the sentence (dat) should merge with
-            # previous sentence (newdat)
-            if (very_hard_start or
-                    (soft_start and hard_end) or
-                    (hard_start and soft_end)):
-                newdat += ' '+dat
-            # if note, current sentence should be a new sentence
-            # and previous sentence has to be added
+        Returns
+        -------
+        set of str
+            Set of all words in the detected language of the string,
+            corresponding to a value of the self.word_dictionaries object.
+            Is used for filtering the gibberish from the pdf texts.
+            If no language was detected, returns an empty set and
+            won't use the functionality.
+        """
+        lang = self.translator.detect(string[:5000]).lang
+        if lang not in self.word_dictionaries:
+            if (self.default_lang and
+                    self.default_lang in self.word_dictionaries):
+                return self.word_dictionaries[self.default_lang]
             else:
+                return {}
+        return self.word_dictionaries[lang]
+
+    def format_txt(self,
+                   pages_text,
+                   n_ignore=1):
+        """
+        Formats a list of strings from pages of a pdf into a list of sentences.
+
+        It will analyze the page breaks with simple regex and identify if a
+        sentence continues on the next page.
+        If that is the case, the sentence will be joined to
+        the previous sentence in the previous page, and treated as if it
+        was written on that page entirely.
+
+        This is because searches on legal documents tend to aim at retrieving
+        sentences/clauses, and therefore the position of the start of the
+        sentence.
+
+        Parameters
+        ----------
+        pages_text: list of str
+            List of strings where each string is the text on the page
+            (obtained from pdftotext, for example).
+
+        n_ignore: int, optional
+            Number of pages to ignore at the start of the pdf.
+            Default is 1 (ignores the cover page).
+
+        Returns
+        -------
+        list of list of str
+            List of the text on the page, where the text is separated
+            into a list of the sentences on the page.
+        """
+
+        dict_words = self.dictionary_detect(
+            ' '.join(' '.join(pages_text[n_ignore:]).split())
+            )
+
+        data = pages_text + ['.Ending final flag.']
+        # File data that will be returned by the function
+        fdata = []
+        # Page data. fdata will be a list of newpage
+        newpage = []
+        # Sentence data
+        newdat = ''
+        # Flag indicating that we are in a new page
+        newpageflag = False
+
+        # All periods will delimit the end of a sentence
+        # Therefore, the following expressions will be replaced
+        replacelist = {'Mr.': 'Mr',
+                       'Ms.': 'Ms',
+                       'Mrs.': 'Mrs',
+                       'Dr.': 'Dr'}
+
+        for pagex in data:
+            page = pagex
+            # Replacement to get rid of periods that aren't at the end of
+            # a sentence
+            for k, v in replacelist.items():
+                page = page.replace(k, v)
+
+            # This flag will be True at the start of a page is the previous
+            # page was completely empty, therefore, adding an empty page here
+            if newpageflag:
+                fdata.append([])
+            newpageflag = True
+
+            # Iteration over all sentences
+            for datx in page.replace('. ', '.\n').split('\n'):
+                # Gets rids of non-space characters
+                dat = ' '.join(datx.split())
+                # iflag will check if the  sentence contains any real word
                 iflag = False
                 # Gets rid of non-alphanumeric characters for
                 # dictionary analysis
                 for w in re.sub('[^a-zA-Z]+',
                                 ' ',
-                                unidecode(newdat)).lower().split():
-                    if (not dict_words or
-                            (w in dict_words and len(w) > 1)):
+                                unidecode(dat)).lower().split():
+                    if (not dict_words) or w in dict_words:
                         iflag = True
                         break
-                # If sentence contains real words that are
-                # not single letters (devoid of information)
-                # then adds the data to the page
-                if iflag:
-                    newpage.append(newdat)
-                # if we are in a new page, adding the prvious page to data
-                if newpageflag:
-                    fdata.append(newpage)
-                    newpage = []
-                    newpageflag = False
-                # creating new sentence
-                newdat = dat
-    return fdata[n_ignore:]
+
+                # if sentence devoid of true words
+                if not iflag:
+                    continue
+
+                # ending  of the previous sentence
+                soft_end = False
+                hard_end = False
+                if len(newdat) > 0:
+                    soft_end = newdat[-1].isnumeric() or newdat[-1].isalpha()
+                    hard_end = newdat[-1].islower() or newdat[-1] in '-):;,"\''
+                # start of the current sentence
+                soft_start = (dat[0].isalpha() or
+                              dat[0].isnumeric() or
+                              dat[0] in '($"\'')
+                hard_start = dat[0].islower()
+                very_hard_start = (hard_start and
+                                   len(dat.split()[0]) > 1 and
+                                   dat.split()[0] in dict_words)
+
+                # if the sentence (dat) should merge with
+                # previous sentence (newdat)
+                if (very_hard_start or
+                        (soft_start and hard_end) or
+                        (hard_start and soft_end)):
+                    newdat += ' '+dat
+                # if note, current sentence should be a new sentence
+                # and previous sentence has to be added
+                else:
+                    iflag = False
+                    # Gets rid of non-alphanumeric characters for
+                    # dictionary analysis
+                    for w in re.sub('[^a-zA-Z]+',
+                                    ' ',
+                                    unidecode(newdat)).lower().split():
+                        if (not dict_words or
+                                (w in dict_words and len(w) > 1)):
+                            iflag = True
+                            break
+                    # If sentence contains real words that are
+                    # not single letters (devoid of information)
+                    # then adds the data to the page
+                    if iflag:
+                        newpage.append(newdat)
+                    # if we are in a new page, adding the prvious page to data
+                    if newpageflag:
+                        fdata.append(newpage)
+                        newpage = []
+                        newpageflag = False
+                    # creating new sentence
+                    newdat = dat
+        return fdata[n_ignore:]
 
 
 class pdf_treatment():
@@ -452,6 +520,16 @@ class Sentences():
         Corresponds the output_folder of the pdf_treatment().pdftotext()
         function.
 
+    text_treatment: text_treatment()
+        text_treatment() class object containing word dictionaries
+        for filtering text when reading.
+
+    dict_words: set of str
+        Set of words of the language of the document in filter_text() function.
+        Is used for filtering the gibberish from the pdf texts.
+        If None, will not use this functionality.
+        Default is None.
+
     iter_total: int, optional
         Total of iterator passes. Used to show progress bar. Default is 1.
 
@@ -473,10 +551,17 @@ class Sentences():
 
     def __init__(self,
                  pkl_folder,
+                 text_treatment,
+                 dict_words=None,
                  iter_total=1,
                  verbose=True):
         self.pkl_folder = pkl_folder
+        self.text_treatment = text_treatment
         self.iter_total = iter_total
+        if dict_words is None:
+            self.dict_words = {}
+        else:
+            self.dict_words = dict_words
         self.iter_i = 1
         self.verbose = True
 
@@ -498,11 +583,7 @@ class Sentences():
                 with open(open(Path(self.pkl_folder) / fname)) as f:
                     pages_text = [f.read()]
             if pages_text:
-                
-                
-               # LANGUAGE RECOGNITION HERE TO CHOOSE DICTIONARY 
-               
-                for page in format_txt(pages_text):
+                for page in self.text_treatment.format_txt(pages_text):
                     for sent in page:
                         yield cleanpassage(sent).split()
         self.iter_i += 1
@@ -525,16 +606,23 @@ class create_index():
         All other output and model files will be put in Parent(pkl_folder).
         If None, will use the current Path()/txt-pdftotext. Default is None.
 
-    english_words: set of str, optional
-        String containing all dictionary words for the English language.
-        Is used for filtering the gibberish from the pdf texts and
-        recognize language. If None, will not use those functionalities.
+    word_dictionaries: dict of str: set of str, optional
+        Each dictionary (in the values of the object) is a set of strings
+        containing all dictionary words for a specific language.
+        Languages are identified by a 2-letters string (in the keys of the
+        object) which are the results of the
+        googletrans.Translator().detect().lang function.
+        Dictionaries are used for filtering the gibberish from the pdf texts
+        and recognize language.
+        If None/empty, will not use those functionalities.
         Default is None.
 
-    french_words: set of str, optional
-        String containing all dictionary words for the French language.
-        Is used for filtering the gibberish from the pdf texts and
-        recognize language. If None, will not use those functionalities.
+    default_lang: str, optional
+        Default language of the dictionaries. Corresponds to a key of the
+        word_dictionaries object to default to if the language
+        recognition fails.
+        If None or empty, no dictionary will be used if the language
+        recognition fails.
         Default is None.
 
     verbose: bool, optional
@@ -546,6 +634,10 @@ class create_index():
     root_folder: str
         Path to the main repository of the analysis, where model files
         and outputs will be saved. Corresponds to Parent(pkl_folder).
+
+    text_treatment: text_treatment()
+        text_treatment() class object containing word dictionaries
+        for filtering text when reading.
 
     allvocab_to_widx: dict of {str: int}
         Dictionary where the key is the string of a word in the corpus,
@@ -623,7 +715,7 @@ class create_index():
         than 2 Gb, so size_sindex should not be higher than 500M
         (times type_invidx = 'u4' which equals 2 Gb)
 
-    widx_to_cumcount:
+    widx_to_cumcount: 
 
     allvocab_to_widxord:
 
@@ -638,13 +730,12 @@ class create_index():
     embedding_matrix:
         vector corresponding to word with index wvidx
         wvidx is a specific word2vec index
-
     """
 
     def __init__(self,
                  pkl_folder=None,
-                 english_words=None,
-                 french_words=None,
+                 word_dictionaries=None,
+                 default_lang=None,
                  verbose=True):
         if pkl_folder is None:
             self.pkl_folder = str(Path().absolute().parent /
@@ -652,9 +743,10 @@ class create_index():
         else:
             self.pkl_folder = pkl_folder
         self.root_folder = str(Path(self.pkl_folder).parent)
-        self.english_words = english_words
-        self.french_words = french_words
         self.verbose = verbose
+        self.text_treatment = text_treatment(
+            word_dictionaries=word_dictionaries,
+            default_lang=default_lang)
 
         # Meta-parameters
         self.sidx = 0
@@ -805,11 +897,7 @@ class create_index():
                     pages_text = [f.read()]
             else:
                 raise NameError('filetype introuvable')
-
-            
-                # LANGUAGE RECOGNITION HERE TO CHOOSE DICTIONARY 
-                        
-            for page in format_txt(pages_text):
+            for page in self.text_treatment.format_txt(pages_text):
                 # Updating the indexes for the page breaks
                 self.pag_breaks.append(self.sidx)
 
@@ -1080,7 +1168,9 @@ class create_index():
             print(str(datetime.now())+'\t'+'Word2vec training')
 
         num_workers = multiprocessing.cpu_count()
+
         sentences = Sentences(self.pkl_folder,
+                              self.text_treatment,
                               iter_total=num_iter+1,
                               verbose=self.verbose)
 
@@ -1187,11 +1277,7 @@ class create_index():
                 with open(open(Path(self.pkl_folder) / fname)) as f:
                     pages_text = [f.read()]
             if pages_text:
-                
-                
-                # LANGUAGE RECOGNITION HERE TO CHOOSE DICTIONARY 
-               
-                for page in format_txt(pages_text):
+                for page in self.text_treatment.format_txt(pages_text):
                     yield ' '.join([cleanpassage(sent)
                                     for sent in page]).split()
 
@@ -1308,6 +1394,275 @@ class create_index():
         self.sentence2vec()
 
 
+class query():
+    """
+    Parameters
+    ----------
+        root_folder
+        
+        word_dictionaires
+        
+        default_lang
+
+    Attributes
+    ----------
+        idx_to_filename.pkl
+        pag_breaks.npy
+        doc_breaks.npy
+        hyper_params.pkl
+        allvocab_to_widxord.pkl
+        widxord_to_cumcount.npy
+        full_inverted[X].npy
+        page_vectors[X].npy
+        wvvocab_to_wvidx.pkl
+        wvidx_to_widxord.npy
+        embedding_matrix.npy
+        pca_component.npy
+            
+        filename_to_idx
+        size_accessload: Parameter to optimize speed of importing page_vectors and calculating cosine similarity
+        full_inverted_memmaps
+        page_vectors_memmaps
+        pca_component
+    """
+
+    def __init__(self,
+                 root_folder,
+                 word_dictionaries=None,
+                 default_lang=None):
+        self.root_folder = root_folder
+        self.text_treatment = text_treatment(
+            word_dictionaries=word_dictionaries,
+            default_lang=default_lang)
+
+        # Import all model files here
+        model_path = Path(self.root_folder) / 'models'
+
+        self.idx_to_filename = pickle.load(
+            open(model_path / 'idx_to_filename.pkl', 'rb')
+            )
+        self.filename_to_idx = {v: k for k, v in self.idx_to_filename.items()}
+
+        self.pag_breaks = np.load(model_path / 'pag_breaks.npy')
+        self.doc_breaks = np.load(model_path / 'doc_breaks.npy')
+        (self.size_sindex,
+         self.embedding_size,
+         self.type_word,
+         self.type_invidx) = \
+            pickle.load(open(model_path / 'hyper_params.pkl', 'rb'))
+
+        self.size_accessload = 100000
+
+        self.allvocab_to_widxord = pickle.load(
+            open(model_path / 'allvocab_to_widxord.pkl', 'rb')
+            )
+
+        # widxord_to_allvocab = \
+        #     {v: k for k, v in self.allvocab_to_widxord.items()}
+        self.widxord_to_cumcount = \
+            np.load(model_path / 'widxord_to_cumcount.npy')
+
+        self.full_inverted_memmaps = {}
+        type_invidx_size = int(self.type_invidx[-1])
+        full_inverted_list = sorted([model
+                                     for model in os.listdir(model_path)
+                                     if (model[:13] == 'full_inverted' and
+                                         model[-4:] == '.npy')])
+        for full_inverted_path in full_inverted_list:
+            if full_inverted_path != full_inverted_list[-1]:
+                offset = (os.path.getsize(model_path / full_inverted_path) -
+                          self.size_sindex*type_invidx_size)
+            else:
+                offset = (os.path.getsize(model_path / full_inverted_path) -
+                          ((self.widxord_to_cumcount[-1] % self.size_sindex) *
+                           type_invidx_size))
+            #the keys here are wrong  
+            self.full_inverted_memmaps[model_path / full_inverted_path] = \
+                np.memmap(model_path / full_inverted_path,
+                          dtype=self.type_invidx,
+                          mode='r',
+                          offset=offset)
+
+        self.page_vectors_memmaps = []
+        type_pv_size = int('f4'[-1])
+        size_page = (self.size_sindex//self.embedding_size)
+        page_vectors_list = sorted([model
+                                    for model in os.listdir(model_path)
+                                    if (model[:12] == 'page_vectors' and
+                                        model[-4:] == '.npy')])
+        for page_vectors_path in page_vectors_list:
+            if page_vectors_path != page_vectors_list[-1]:
+                shape = (size_page, self.embedding_size)
+                offset = (os.path.getsize(model_path / page_vectors_path) -
+                          shape[0]*shape[1]*type_pv_size)
+            else:
+                shape = (len(self.pag_breaks) % size_page, self.embedding_size)
+                offset = (os.path.getsize(model_path / page_vectors_path) -
+                          shape[0]*shape[1]*type_pv_size)
+            self.page_vectors_memmaps.append(
+                np.memmap(model_path / page_vectors_path,
+                          dtype='f4',
+                          mode='r',
+                          shape=shape,
+                          offset=offset)
+                )
+
+        self.wvvocab_to_wvidx = pickle.load(
+            open(model_path / 'wvvocab_to_wvidx.pkl', 'rb')
+            )
+        self.wvidx_to_widxord = np.load(model_path / 'wvidx_to_widxord.npy')
+
+        type_wv_size = int('f4'[-1])
+        shape = (len(self.wvvocab_to_wvidx), self.embedding_size)
+        offset = (os.path.getsize(model_path / 'embedding_matrix.npy') -
+                  shape[0]*shape[1]*type_wv_size)
+        self.embedding_matrix = np.memmap(model_path / 'embedding_matrix.npy',
+                                          dtype='f4',
+                                          mode='r',
+                                          shape=shape,
+                                          offset=offset)
+        self.pca_component = np.load(model_path / 'pca_component.npy')
+
+    def answers_to_output(self,
+                          answers,
+                          n_results):
+        """
+        Generates a text string of all answers to output in a .csv format
+        
+        Parameters
+        ----------
+        answers:
+        n_results:
+            (outputs of retrieve_closest_passages) TO COMPLETE 
+            
+        """
+        output_data = 'Collective agreement number,Page numbers'
+        for ans in answers[:n_results[3]]:
+            doc_idx = bisect_right(self.doc_breaks, ans[0][0])-1
+            lin = (self.idx_to_filename[doc_idx] + ',' +
+                   str(ans[0][0]-self.doc_breaks[doc_idx]))
+            for a in ans[1]:
+                lin += '/' + str(a-self.doc_breaks[doc_idx])
+            output_data += '\n'+lin
+        return output_data
+
+    def widxord_to_invidx(self,
+                          widxord):
+        """Returns the positions in full_inverted indexes containing a word
+
+        Parameters
+        ----------
+        widxord: int
+            The ordered index corresponding to the desired word, obtained
+            with self.allvocab_to_widxord()
+
+        Returns
+        -------
+        list of (str, int, int)
+            Each element of the returned list is a tuple.
+            The first element is the filename of the inverted index, which
+            should be located in the models folder
+            The second is the position in that file where the information
+            about the word (the inverted indexes related to that word)
+            begins
+            The third element is the position in that file where
+            the information about the word ends, exclusively
+            Normally, this list is of length 1, because the inverted
+            index is sorted. However, it's possible that a word information
+            is separated over 2 index files if it began at the end of
+            a file.
+        """
+        fix_list = []
+        nzer = int(np.log10(
+            self.widxord_to_cumcount[-1]//self.size_sindex+1
+            ))+1
+
+        full_inverted_path = 'full_inverted%0'
+
+        if widxord == 0:
+            idx_sa = 0
+        else:
+            idx_sa = self.widxord_to_cumcount[widxord-1]
+        idx_sb = self.widxord_to_cumcount[widxord]-1
+        full_inv_idx_a = ((idx_sa - idx_sa % self.size_sindex) //
+                          self.size_sindex) + 1
+        full_inv_idx_b = ((idx_sb - idx_sb % self.size_sindex) //
+                          self.size_sindex) + 1
+        for full_inv_idx in range(full_inv_idx_a, full_inv_idx_b):
+            fix_list.append([
+                (full_inverted_path+'%i' % nzer+'i.npy') % full_inv_idx_a,
+                idx_sa % self.size_sindex,
+                self.size_sindex
+                ])
+        if full_inv_idx_a != full_inv_idx_b:
+            i_start = 0
+        else:
+            i_start = idx_sa % self.size_sindex
+        fix_list.append([
+            (full_inverted_path+'%i' % nzer+'i.npy') % full_inv_idx_b,
+            i_start,
+            idx_sb % self.size_sindex+1])
+        return fix_list
+
+    def query_to_s2v(self,
+                     query):
+        """
+        Transforms a sentence in a single vector.
+
+        Uses removal of the main PCA component for noise removal,
+        as described in sentence2vec algorithm
+
+        Uses self.wvvocab_to_wvidx, self.wvidx_to_widxord,
+        self.widxord_to_cumcount, self.embedding_matrix,
+        self.pca_component
+
+        This code is very similar to create_index().s2v_nopca,
+        could it be grouped?
+
+        Parameters
+        ----------
+        query: str
+            String corresponding to the sentence to vectorize
+
+        Returns
+        -------
+            numpy array
+            Vector of the embedding of the sentence
+        """
+        a = 1e-3
+        vs = np.zeros(self.embedding_size, dtype='f4')
+        sentence_length = 0
+        for word in cleanpassage(query).split():
+            if word in self.wvvocab_to_wvidx:
+                sentence_length += 1
+                wvidx = self.wvvocab_to_wvidx[word]
+                widxord = self.wvidx_to_widxord[wvidx]
+                if widxord == 0:
+                    count = self.widxord_to_cumcount[widxord]
+                else:
+                    count = (self.widxord_to_cumcount[widxord] -
+                             self.widxord_to_cumcount[widxord-1])
+                # a_value is the smooth inverse frequency, (sif)
+                # a_value could be also the tf-idf score of the word
+                # word_frequency in document set goes higher,
+                # a_value is less.
+                a_value = a / (a + count/self.widxord_to_cumcount[-1])
+
+                # vs += sif * word_vector
+                vs = np.add(vs, np.multiply(a_value,
+                                            self.embedding_matrix[wvidx]))
+        if sentence_length != 0:
+            vs = np.divide(vs, sentence_length)  # weighted average
+
+        u = self.pca_component
+        proj_u = np.multiply(u, u.reshape(-1, 1))
+        vsn = np.subtract(vs, proj_u.dot(vs))
+        vsn_norm = np.linalg.norm(vsn)
+        if vsn_norm != 0:
+            vsn = np.divide(vsn, vsn_norm)
+        return vsn
+
+
 if __name__ == '__main__':
     # Treatment of pdftotext on the pdf folder
     # PT = pdf_treatment(exec_path='xpdf-tools-mac-4.02/bin64/')
@@ -1325,6 +1680,38 @@ if __name__ == '__main__':
     CI = create_index()
     a = CI.format_txt(pages_text)
     """
-    CI = create_index('test_data/txt-pdftotext')
-    CI.compute()
+
+    # Dictionaries import
+
+    # English
+    try:
+        import json
+        filename = "words_dictionary.json"
+        with open(filename, "r") as english_dictionary:
+            valid_words = json.load(english_dictionary)
+            english_words = valid_words.keys()
+    except Exception as e:
+        print(str(e))
+
+    # French
+    try:
+        filename = "liste.de.mots.francais.sansaccents.txt"
+        with open(filename, "r") as french_dictionnary:
+            data = french_dictionnary.read()
+        valid_words = dict((el, 0) for el in data.split('\n'))
+        french_words = valid_words.keys()
+    except Exception as e:
+        print(str(e))
+
+    word_dictionaries = {'en': english_words,
+                         'fr': french_words}
+
+    #CI = create_index('test_data/txt-pdftotext',
+    #                  word_dictionaries=word_dictionaries,
+    #                  default_lang='en')
+    #CI.compute()
+    
+    Q = query('test_data',
+              word_dictionaries=word_dictionaries,
+              default_lang='en')
 
