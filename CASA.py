@@ -21,6 +21,7 @@ from gensim.models import Word2Vec
 import multiprocessing
 from sklearn.decomposition import IncrementalPCA
 from googletrans import Translator
+from nltk.corpus import stopwords
 
 
 def progressBar(value, endvalue, bar_length=20):
@@ -129,6 +130,122 @@ def cleanpassage(passage):
         else:
             newpassage += ' '
     return ' '.join(newpassage.split()).lower()
+
+
+def span_shift(span,
+               string):
+    """
+    Returns the character position shifts from usage of unidecode().
+
+    Using unidecode sometimes creates 2 characters out of a single one,
+    which shifts the character position in the string.
+
+    Parameters
+    ----------
+    span: (int, int)
+        The position range of the cleaned unidecoded string to consider
+        in format [starting:ending (exclusively)]
+
+    string : str
+        The raw sentence that was cleaned with unidecode
+
+    Returns
+    -------
+    (int, int)
+        Range of the original, raw, untreated text corresponding
+        to the characters that would create the ones in the specified
+        range on a cleaned string.
+    """
+    weird_char = {}
+    for c in set(string):
+        if (c not in ('0123456789'
+                      'abcdefghijklmnopqrstuvwxyz'
+                      'ABCDEFGHIJKLMNOPQRSTUVWXYZ') and
+                len(unidecode(c)) != 1):
+            weird_char[c] = len(unidecode(c))
+    if not weird_char:
+        return span
+
+    if span[0] < 0:
+        span[0] += len(unidecode(string))
+    if span[1] < 0:
+        span[1] += len(unidecode(string))
+    if span[0] < 0 or span[1] < 0 or span[1] < span[0]:
+        raise NameError('Incorrect span')
+
+    old_span = []
+    i_clean = 0
+    end_flag = False
+    for i_raw, c in enumerate(string):
+        if c in weird_char:
+            i_clean += weird_char[c]-1
+        if not old_span and i_clean > span[0]:
+            old_span.append(i_raw)
+        if end_flag and i_clean >= span[1]:
+            old_span.append(i_raw)
+            break
+        if i_clean >= span[1] - 1:
+            end_flag = True
+        i_clean += 1
+
+    return old_span
+
+
+def ngram_positions(ngram,
+                    phrase):
+    """Returns all positions of the ngram in a sentence
+
+    Parameters
+    ----------
+    ngram: str
+        list of characters to match in the sentence
+
+    phrase: str
+        sentence to analyse
+
+    Returns
+    -------
+    List of (int, int)
+        List of all starting/ending(exclusively) positions where the ngrams
+        are located in the sentence string
+    """
+    positions = []
+    index = 0
+    while index < len(phrase):
+        index = phrase.find(ngram, index)
+        if index == -1:
+            break
+        positions.append([index, index+len(ngram)])
+        index += 1
+    return positions
+
+
+def fuse_positions(positions):
+    """
+    Fuses different integer spans when needed be.
+
+    For example, [1,4] and [4,6] will be merged as [1,6]
+
+    Parameters
+    ----------
+    positions: list of (int, int)
+        The range of indexing position to be merged together
+        in format [starting:ending (exclusively)]
+
+    Returns
+    -------
+    list of (int, int)
+        The new list of ranges, but merged when needed be
+    """
+    fpos = sorted(positions, key=lambda k: k[0])
+    i = 1
+    while i < len(fpos):
+        if fpos[i][0] <= fpos[i-1][1]:
+            fpos[i-1][1] = max(fpos[i-1][1], fpos[i][1])
+            del fpos[i]
+        else:
+            i += 1
+    return fpos
 
 
 class text_treatment():
@@ -1400,9 +1517,9 @@ class query():
     ----------
         root_folder
         
-        word_dictionaires
+        word_dictionaires: need keys for all available languages (even if dictionaries are empty)
         
-        default_lang
+        default_lang: 
 
     Attributes
     ----------
@@ -1424,6 +1541,8 @@ class query():
         full_inverted_memmaps
         page_vectors_memmaps
         pca_component
+        
+        stopwords_keys
     """
 
     def __init__(self,
@@ -1434,6 +1553,8 @@ class query():
         self.text_treatment = text_treatment(
             word_dictionaries=word_dictionaries,
             default_lang=default_lang)
+        self.stopwords_keys = {'en': 'english',
+                               'fr': 'french'}
 
         # Import all model files here
         model_path = Path(self.root_folder) / 'models'
@@ -1476,8 +1597,7 @@ class query():
                 offset = (os.path.getsize(model_path / full_inverted_path) -
                           ((self.widxord_to_cumcount[-1] % self.size_sindex) *
                            type_invidx_size))
-            #the keys here are wrong  
-            self.full_inverted_memmaps[model_path / full_inverted_path] = \
+            self.full_inverted_memmaps[full_inverted_path] = \
                 np.memmap(model_path / full_inverted_path,
                           dtype=self.type_invidx,
                           mode='r',
@@ -1537,7 +1657,7 @@ class query():
             
         """
         output_data = 'Collective agreement number,Page numbers'
-        for ans in answers[:n_results[3]]:
+        for ans in answers[:n_results[0]]:
             doc_idx = bisect_right(self.doc_breaks, ans[0][0])-1
             lin = (self.idx_to_filename[doc_idx] + ',' +
                    str(ans[0][0]-self.doc_breaks[doc_idx]))
@@ -1661,6 +1781,588 @@ class query():
         if vsn_norm != 0:
             vsn = np.divide(vsn, vsn_norm)
         return vsn
+
+    def query_to_answers(self,
+                         query_idx):
+        """
+        Returns page numbers of pages containing words from the query.
+
+        Uses pag_breaks, full_inverted_memmaps, widxord_to_cumcount
+
+        Takes about 1 sec per 200 000 occurences of a query word in the
+        corpus, per query word.
+
+        Parameters
+        ----------
+        query_idx: List of list of int
+            List of list of word indexes (widxord) in the query
+            A sublist of length > 1 means an exact expression in
+            quotation marks
+
+        Returns
+        -------
+        List of list of int
+            For each word (widxord) or group of words in exact expression,
+            returns the list of all page numbers  (as indexed in pag_breaks)
+            containing that word or exact expression
+        """
+        answers_per_word = []
+        for words_idx in query_idx:
+
+            # If exact expression (in quotation marks)
+            if len(words_idx) > 1:
+                # find rarest word
+                rare_word_idx = -1
+                rare_rarity = self.widxord_to_cumcount[-1]
+                for word_idx, widxord in enumerate(words_idx):
+                    rarity = sum(
+                        dat[2] - dat[1]
+                        for dat in self.widxord_to_invidx(widxord)
+                        )
+                    if rarity < rare_rarity:
+                        rare_word_idx = word_idx
+                        rare_rarity = rarity
+
+                # find results for rarest word first (for quicker results)
+                rare_pags = []
+                rare_poss = []
+                for full_inv_idx, start_i, end_i in \
+                        self.widxord_to_invidx(words_idx[rare_word_idx]):
+                    for inverted in self.full_inverted_memmaps[
+                            full_inv_idx
+                            ][start_i:end_i]:
+                        rare_pag = bisect_right(self.pag_breaks,
+                                                inverted) - 1
+                        rare_pos = inverted - self.pag_breaks[rare_pag]
+                        rare_pags.append(rare_pag)
+                        rare_poss.append(rare_pos)
+
+                rare_poss_np = np.array(rare_poss, dtype=self.type_invidx)
+
+                # find results that match the other words of the
+                # exact expression in the right order in the document
+                answers_list = []
+                for word_idx, widxord in [
+                        (i, w) for i, w in enumerate(words_idx)
+                        if i != rare_word_idx
+                        ]:
+                    if self.type_invidx == 'u4':
+                        word_idx_np = np.uint32(word_idx)
+                        rare_word_idx_np = np.uint32(rare_word_idx)
+                    else:
+                        word_idx_np, rare_word_idx_np = \
+                            np.array([word_idx, rare_word_idx],
+                                     dtype=self.type_invidx)
+                    idx_rare = 0
+                    answer = []
+                    rare_inverted = \
+                        (rare_poss_np[idx_rare] +
+                         self.pag_breaks[rare_pags[idx_rare]] -
+                         rare_word_idx_np +
+                         word_idx_np)
+                    for inverted in [
+                            i for i in self.full_inverted_memmaps[
+                                full_inv_idx][start_i:end_i]
+                            for full_inv_idx, start_i, end_i in
+                            self.widxord_to_invidx(widxord)
+                            ]:
+
+                        while inverted > rare_inverted:
+                            idx_rare += 1
+                            if idx_rare != len(rare_pags):
+                                rare_inverted = \
+                                    (rare_poss_np[idx_rare] +
+                                     self.pag_breaks[rare_pags[idx_rare]] -
+                                     rare_word_idx_np +
+                                     word_idx_np)
+                            else:
+                                rare_inverted = \
+                                    (self.widxord_to_cumcount[-1] +
+                                     np.uint32(1))
+                        if inverted == rare_inverted:
+                            pag = bisect_right(self.pag_breaks,
+                                               inverted)-1
+                            pos = inverted - self.pag_breaks[pag]
+                            if (idx_rare != len(rare_pags) and
+                                    pag == rare_pags[idx_rare] and
+                                    (pos - word_idx) == (rare_poss[idx_rare] -
+                                                         rare_word_idx)):
+                                answer.append(idx_rare)
+                    answers_list.append(answer)
+                answer = set(answers_list[0])
+                for ans in answers_list[1:]:
+                    answer = answer.intersection(ans)
+                answers_per_word.append(set([rare_pags[ans]
+                                             for ans in answer]))
+
+            # If single word
+            elif len(words_idx) == 1:
+                answers_per_word.append(
+                    set([bisect_right(self.pag_breaks, inverted) - 1
+                         for full_inv_idx, start_i, end_i in
+                         self.widxord_to_invidx(words_idx[0])
+                         for inverted in self.full_inverted_memmaps[
+                             full_inv_idx][start_i:end_i]])
+                    )
+        return answers_per_word
+
+    def retrieve_closest_passages(self,
+                                  query,
+                                  from_pdfs=None,
+                                  trans_flag=True,
+                                  time_flag=False):
+        """
+        Returns the results (pages) in the corpus that match the query.
+        
+        Uses SOMETHING (word match, then cosine similarity) TO COMPLETE 
+        
+        Quotation marks means exact expression
+        
+        Uses attributes doc_breaks, pag_breaks, idx_to_filename,
+        filename_to_idx, full_inverted_memmaps, page_vectors_memmaps
+        widxord_to_cumcount,
+        size_sindex, embedding_size, type_invidx, size_accessload
+
+        Parameters
+        ----------
+        query: str
+            The query in string format
+
+        from_pdfs: List of str, optional
+            List of pdf filenames (without extensions) to perform the query in.
+            None is in all pdfs. Default is None
+
+        trans_flag: bool, optional
+            True means that the query will be translated to all languages
+            in self.text_treatement.word_dictionaries.keys()
+            Default is True.
+
+        time_flag: bool, optional
+            If true, prints the time the query took in the console,
+            Default is False
+
+        Returns
+        -------
+        (List of (List of int)*3, List of (int)*3)
+            The first object is a nested list of the index of results.
+            Each item [n] in the list contains all results from the most
+            relevant collective agreement, in order of relevance.
+            Each item contains 3 lists:
+            [n][0]: The 1-length list of the most relevant result of this
+                    particular collective agreement
+            [n][1]: Every other possible relevent results in this particular
+                    collective agreement (that matches words from the query)
+                    in order of relevance
+            [n][2]: All other results in the collective agreement
+                    -including irrelevant ones-  in order of relevance.
+
+            The second object is a list with the numbers of results.
+            [0]: Number of results including all words of the query
+            [1]: Number of results including at least one word of the query
+            [2]: Number of documents in the database
+                 (potential maximum number of results)
+        """
+        # For calculation of time the query took
+        start_time = time.time()
+
+        # pdf_list = clean set of pdfs filenames to search in.
+        if from_pdfs is not None:
+            pdf_list = set([x.replace('-', '') for x in from_pdfs])
+        else:
+            pdf_list = set(self.idx_to_filename.values())
+
+        # First object to return
+        answers = []
+        # Second object to return
+        n_results = [[], [], []]
+
+        # Hardcoded: If query is empty, return all results (about 1sec)
+        if len(cleanpassage(query)) == 0:
+            ans = []
+            doc_idx = 0
+            for filename in pdf_list:
+                doc_idx = self.filename_to_idx[filename]
+                pag_idx_a = self.doc_breaks[doc_idx]
+                pag_idx_b = self.doc_breaks[doc_idx+1]
+                ans = [[int(pag_idx_a)],
+                       [pag_idx for pag_idx in range(pag_idx_a+1, pag_idx_b)],
+                       []]
+                answers.append(ans)
+            n_results[0] = len(pdf_list)
+            n_results[1] = len(pdf_list)
+            n_results[2] = len(pdf_list)
+            return sorted(answers, key=lambda x: x[0][0]), n_results
+
+        # doc_list = clean set of document index of the documents in pdf_list
+        doc_list = set([self.filename_to_idx[filename]
+                        for filename in pdf_list
+                        if filename in self.filename_to_idx])
+
+        # from_pdfs = None is the flag indicating there's no filter
+        if len(doc_list) == len(self.doc_breaks)-1:
+            from_pdfs = None
+
+        # QUERY TREATMENT SECTION (about 300-500ms)
+        # Clean quotation marks format
+        for c in '“”«»':
+            query = query.replace(c, '"')
+
+        # Translation of the query in query_trans and language detection TO FIX
+        query_lang = self.text_treatment.translator.detect(query[:5000]).lang
+        all_lang = self.text_treatment.word_dictionaries.keys()
+        if query_lang not in all_lang:
+            if self.text_treatment.default_lang:
+                query_lang = self.text_treatment.default_lang
+            else:
+                query_lang = None
+
+        # List of all queries in all languages
+        list_query = [query]
+        list_lang = [query_lang]
+        if trans_flag and query_lang:
+            for dest in [lang for lang in all_lang
+                         if lang != query_lang]:
+                list_query.append(
+                    self.text_treatment.translator.translate(
+                        query[:5000], dest=dest).text)
+                list_lang.append(dest)
+
+        # List of list of word indexes (widxord) in the query
+        # A list of length > 1 means an exact expression in quotation marks
+        list_query_idx = []
+        # Transforming query in sentence2vec vector
+        list_query_vect = []
+        for j, query_trans in enumerate(list_query):
+            query_idx_trans = []
+            # Makes sure to have an even number of quotation marks.
+            # If not, delete the last one
+            if query_trans.count('"') % 2 != 0:
+                idx = query_trans.rfind('"')
+                list_query[j] = query_trans[:idx]+query_trans[idx+1:]
+
+            for i, s in enumerate(query_trans.split('"')):
+                if i % 2 == 0:
+                    if list_lang[j]:
+                        stopwords_set_trans = set(stopwords.words(
+                            self.stopwords_keys(list_lang[j])
+                            ))
+                    else:
+                        stopwords_set_trans = {}
+                    query_idx_trans += \
+                        [[self.allvocab_to_widxord[word]]
+                         for word in cleanpassage(s).split()
+                         if (word in self.allvocab_to_widxord and
+                             word not in stopwords_set_trans)]
+                # If exact expression (between quotation marks)
+                else:
+                    query_idx_trans.append(
+                        [self.allvocab_to_widxord[word]
+                         for word in cleanpassage(s).split()
+                         if word in self.allvocab_to_widxord])
+            list_query_idx.append(query_idx_trans)
+            list_query_vect.append(self.query_to_s2v(query))
+
+        # CREATING RESULTS OBJECT
+        # This is the longest part of the code because it contains multiple
+        # sortings of numpy array which is a long process. Individual sorting
+        # times are indicated below
+
+        # Creating object, filling data about pages, documents and greps
+        # (about 800ms per 1Go of page data vectors = 3M pages with 100
+        # dimensions)
+
+        # 'page' is the page index of the corpus. Results contains data for all
+        # pages in the corpus, but will be filtered eventually with from_pdfs
+        # if from_pdfs!=None
+        # 'doc' is the document index corresponding to the page
+        # 'grep' is the proportion of the keywords of the query that are
+        # textually present in the page
+        # 'distance' is the cosine similarity between the page and the query
+        # 'order' is the order of the document if all pages from the same
+        # document are grouped together and documents are ordered according
+        # to the result of its best page
+        # results are ordered by 'order', then 'grep', then 'distance'
+
+        results = np.zeros(shape=len(self.pag_breaks),
+                           dtype=[('doc', self.type_invidx),
+                                  ('page', self.type_invidx),
+                                  ('order', self.type_invidx),
+                                  ('grep', 'f4'),
+                                  ('distance', 'f4')])
+        results['page'] = np.arange(len(self.ag_breaks))
+        docs = -np.ones(len(self.pag_breaks), dtype=self.type_invidx)
+
+        for doc in doc_list:
+            docs[self.doc_breaks[doc]: self.doc_breaks[doc+1]] = \
+                doc*np.ones(self.doc_breaks[doc+1]-self.doc_breaks[doc],
+                            dtype=self.type_invidx)
+        results['doc'] = docs
+
+        grep = np.zeros(shape=(len(list_query), len(self.pag_breaks)),
+                        dtype='f4')
+        for j, query_idx_trans in enumerate(list_query_idx):
+            for answer in self.query_to_answers(query_idx_trans):
+                for ans in answer:
+                    grep[j][ans] += 1/len(query_idx_trans)
+            results['grep'] = grep.max(axis=0)
+        # Freeing memory
+        del grep
+
+        # Calculating distances - sentence2vec
+        # (about 200ms per 1Go of page data vectors = 3M pages
+        # with 100 dimensions)
+        dist = -np.ones(shape=(len(list_query), len(self.pag_breaks)),
+                        dtype='f4')
+        size_page = self.size_sindex//self.embedding_size
+        for pvidx, page_vectors in enumerate(self.page_vectors_memmaps):
+            mem_batches = ([i*self.size_accessload
+                            for i in range((len(self.page_vectors) - 1) //
+                                           self.size_accessload + 1)] +
+                           [len(self.page_vectors)])
+            for i in range(len(mem_batches)-1):
+                idx_a = mem_batches[i]
+                idx_b = mem_batches[i+1]
+                for j, query_vect_trans in enumerate(list_query_vect):
+                    dist[j][pvidx*size_page+idx_a:pvidx*size_page+idx_b] = \
+                        self.page_vectors[idx_a:idx_b].dot(query_vect_trans)
+
+        results['distance'] = dist.max(axis=0)
+        # Freeing memory
+        del dist
+
+        # Filtering for from_pdfs
+        # (up to 400ms per 1Go of page data vectors = 3M pages
+        # with 100 dimensions)
+        if from_pdfs is not None:
+            results = results[np.where(
+                docs != -np.ones(1, dtype=self.type_invidx)
+                )[0]]
+        # Freeing memory
+        del docs
+
+        # First ordering:
+        # (1,5s for 1Go of page data vectors = 3M pages with 100 dimensions)
+        results = results[np.lexsort((-results['distance'], -results['grep']))]
+
+        # Finding order of documents for grouping documents together
+        # (1,5s for 1Go of page data vectors = 3M pages with 100 dimensions)
+        order = -np.ones(len(results), dtype='f4')
+        doc_order = {}
+        for i, doc in enumerate(results['doc']):
+            if doc not in doc_order:
+                doc_order[doc] = len(doc_order)
+            order[i] = doc_order[doc]
+        results['order'] = order
+        # Freeing memory
+        del order
+
+        # Second ordering:
+        # (1,2s for 1Go of page data vectors = 3M pages with 100 dimensions)
+        results = results[np.lexsort((-results['distance'],
+                                      -results['grep'],
+                                      results['order']))]
+
+        # Final answers object + nresults:
+        # (700ms for 1Go of page data vectors = 3M pages with 100 dimensions)
+        answers = []
+        n_results = [[], [], []]
+        docs = results['doc']
+        pages = results['page']
+        greps = results['grep']
+        ia = 0
+        for ib in np.concatenate((
+                (np.where(np.ediff1d(results['doc']) != 0)[0]+1),
+                np.array([len(results)])
+                )):
+            filename = self.idx_to_filename[docs[ia]]
+            n_results[2].append(filename)
+            if greps[ia] > 0:
+                n_results[1].append(filename)
+            if greps[ia] == 1:
+                n_results[0].append(filename)
+            delim = np.searchsorted(-greps[ia:ib], 0)
+            ans = pages[ia:ib].tolist()
+            answers.append([ans[0:1], ans[1:delim], ans[delim:]])
+            ia = ib
+
+        n_results[0] = len(n_results[0])
+        n_results[1] = len(n_results[1])
+        n_results[2] = len(n_results[2])
+
+        # Printing result time
+        if time_flag:
+            print('Search took %.1f sec' % (time.time()-start_time))
+        return answers, n_results
+
+    def print_closest_passages(self,
+                               query,
+                               answers,
+                               num_answers=None,
+                               trans_flag=True):
+        """
+        Generates info necessary to print  results in a UI
+
+        Uses idx_to_filename, doc_breaks, text_treatment
+
+        The query treatment part is taken from retrieve_closest_passage() and
+        should be it's own thing. Also, language detection is used throughout
+        this and retrieve_closest_passage().
+
+        Parameters
+        ----------
+        query : str
+            The query in string format.
+
+        answers : List of (List of int)*3
+            the output, or a subset of the output,
+            of retrieve_closest_passages(query, from_pdfs)
+
+        num_answers : int, optional
+            Number of displayed answers.
+            None means all answers are going to be displayed, which is a very
+            long calculation. The default is None.
+
+        trans_flag: bool, optional
+            True means that the query will be translated to all languages
+            in self.text_treatement.word_dictionaries.keys()
+            Default is True.
+
+        Returns
+        -------
+        List of [str, str, List of (int, int)]
+            Each individual item of the returned object is a result.
+            Each item [n] of the list contains:
+                [n][0] the string of the code of the answer (pdf_name-page_number) 
+                [n][1] the plain text of the answer
+                [n][2] the list of pairs of characters to highlight in the
+                results - from the text [n][1], you need to highlight all
+                characters [n][2][k][0]:[n][2][k][1] for all k in [n][2].
+        """
+
+        if num_answers is None:
+            num_answers = len(answers)
+
+        # QUery
+        # Clean quotation marks format
+        for c in '“”«»':
+            query = query.replace(c, '"')
+
+        # Translation of the query in query_trans and language detection TO FIX
+        query_lang = self.text_treatment.translator.detect(query[:5000]).lang
+        all_lang = self.text_treatment.word_dictionaries.keys()
+        if query_lang not in all_lang:
+            if self.text_treatment.default_lang:
+                query_lang = self.text_treatment.default_lang
+            else:
+                query_lang = None
+
+        # List of all queries in all languages
+        list_query = [query]
+        list_lang = [query_lang]
+        if trans_flag and query_lang:
+            for dest in [lang for lang in all_lang
+                         if lang != query_lang]:
+                list_query.append(
+                    self.text_treatment.translator.translate(
+                        query[:5000], dest=dest).text)
+                list_lang.append(dest)
+    
+        metalist = []
+        for pag in answers[:num_answers]:
+            doc_idx = bisect_right(self.doc_breaks, pag) - 1
+            metalist.append((doc_idx, pag-self.doc_breaks[doc_idx]))
+        pdflist = list(set([meta[0] for meta in metalist]))
+
+        textCA = []
+        for pdf in pdflist:
+            fname = self.root_folder + self.idx_to_filename[pdf]+'.pkl'
+            pages_text = pickle.load(
+                open(Path(self.pkl_folder) / fname, 'rb')
+                )
+            if pages_text:
+                textCA.append(self.text_treatment.format_txt(pages_text))
+
+        results = []
+        for meta in metalist:
+            text = '\n'.join(textCA[pdflist.index(meta[0])][meta[1]])
+            cleantext = unidecode(text).lower()
+            highlight_pos = []
+
+            if len(cleanpassage(query)) != 0:
+                # Language detection of the answers text is actually this
+                # function's bottleneck
+                if trans_flag:
+                    lang_scores = [0]*len(list_query)
+                    for j, query_trans in list_query:
+                        w_list = cleanpassage(query_trans).split()
+                        for word in w_list:
+                            if list_lang[j]:
+                                stopwords_set_trans = set(stopwords.words(
+                                    self.stopwords_keys(list_lang[j])
+                                    ))
+                            else:
+                                stopwords_set_trans = {}
+                            if (list_lang[j] and
+                                    word not in stopwords_set_trans and
+                                    word in cleantext):
+                                lang_scores[j] += 1
+                        lang_scores[j] = lang_scores[j]/len(w_list)
+
+                    max_idx = [i for i, s in enumerate(lang_scores)
+                               if s == max(lang_scores)]
+                    if len(max_idx) == 1:
+                        text_lang = list_lang[max_idx]
+                    else:
+                        text_lang = self.text_treatment.translator.detect(
+                            cleantext[:5000]
+                            ).lang
+                        if text_lang not in all_lang:
+                            if self.text_treatment.default_lang:
+                                text_lang = self.text_treatment.default_lang
+                            else:
+                                text_lang = None
+                else:
+                    text_lang = query_lang
+
+                if text_lang and query_lang:
+                    query_trans = list_query[list_lang.index(text_lang)]
+                else:
+                    query_trans = query
+
+                # Makes sure to have an even number of quotation marks.
+                # If not, delete the last one
+                if query_trans.count('"') % 2 != 0:
+                    idx = query_trans.rfind('"')
+                    query_highlight = query_trans[:idx]+query_trans[idx+1:]
+                else:
+                    query_highlight = query_trans
+
+                query_words = []
+                if text_lang:
+                    stopwords_set_trans = set(stopwords.words(
+                        self.stopwords_keys(text_lang)
+                        ))
+                else:
+                    stopwords_set_trans = {}
+                for i, s in enumerate(query_highlight.split('"')):
+                    if i % 2 == 0:
+                        for word in cleanpassage(s).split():
+                            if (word not in stopwords_set_trans and
+                                    len(word) >= 3):
+                                query_words.append(word)
+                    # If exact expression
+                    else:
+                        query_words.append(cleanpassage(s))
+
+                for word in query_words:
+                    highlight_pos += ngram_positions(word, cleantext)
+                highlight_pos = fuse_positions(highlight_pos)
+                for i in range(len(highlight_pos)):
+                    highlight_pos[i] = span_shift(highlight_pos[i])
+            results.append([self.idx_to_filename[meta[0]]+'-%i' % meta[1],
+                            text,
+                            highlight_pos])
+        return results
 
 
 if __name__ == '__main__':
