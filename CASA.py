@@ -248,6 +248,59 @@ def fuse_positions(positions):
     return fpos
 
 
+def import_dictionaries(folder=''):
+    """
+    Imports english and french dictionaries
+
+    Needs to have the word_dictionary.json and
+    liste.de.mots.francais.sansaccents.txt in the specified folder
+
+    Parameters
+    ----------
+    folder: dict of {str: str}
+        Folder containing the english and french language files.
+        Default is '', corresponding to current working directory
+
+    Returns
+    -------
+    dict of str: set of str, optional
+        The word_dictionaries object necessary for the create_index() and
+        query() class objects.
+        Each dictionary (in the values of the object) is a set of strings
+        containing all dictionary words for a specific language.
+        Languages are identified by a 2-letters string (in the keys of the
+        object) which are the results of the
+        googletrans.Translator().detect().lang function.
+        Dictionaries are used for filtering the gibberish from the pdf texts
+        and recognize language.
+        If None/empty, will not use those functionalities.
+        Default is None.
+    """
+    # English
+    try:
+        import json
+        filename = "words_dictionary.json"
+        with open(Path(folder) / filename, "r") as english_dictionary:
+            valid_words = json.load(english_dictionary)
+            english_words = valid_words.keys()
+    except Exception as e:
+        print(str(e))
+
+    # French
+    try:
+        filename = "liste.de.mots.francais.sansaccents.txt"
+        with open(Path(folder) / filename, "r") as french_dictionnary:
+            data = french_dictionnary.read()
+        valid_words = dict((el, 0) for el in data.split('\n'))
+        french_words = valid_words.keys()
+    except Exception as e:
+        print(str(e))
+
+    word_dictionaries = {'en': set(english_words),
+                         'fr': set(french_words)}
+    return word_dictionaries
+
+
 class text_treatment():
     """
     Functions for text treatment with dictionary filters.
@@ -759,6 +812,9 @@ class create_index():
     allvocab_to_widx: dict of {str: int}
         Dictionary where the key is the string of a word in the corpus,
         and the value (word index) is an int index identifying the word.
+        The index starts as the default index of order of apparition in the
+        corpus, but then switches to an index ordered by descending word count
+        (widx_ord)
         The exact type of the value is identified via self.type_word
 
     idx_to_filename: dict of {int: str}
@@ -832,21 +888,24 @@ class create_index():
         than 2 Gb, so size_sindex should not be higher than 500M
         (times type_invidx = 'u4' which equals 2 Gb)
 
-    widx_to_cumcount: 
+    widxord_to_cumcount:  numpy array
+        Cumulative count of all words, ordered by descending word count.
+        The word count of a word corresponding to index widx_ord is
+        widxord_to_cumcount[widx_ord] - widxord_to_cumcount[widx_ord-1]
 
-    allvocab_to_widxord:
+    wvvocab_to_wvidx: dict of {str:int}
+        Dictionary where key=word string, where the word
+        occurences > min_word_count specified in the word2vec calculation,
+        and value=wvidx, word2vec_index an index corresponding to the
+        embedding
 
-    wvvocab_to_wvidx:
-        dictionary where key=word string (where the word
-        occurences > min_word_count) and value=wvidx (word2vec_index)
-
-    wvidx_to_widxord:
+    wvidx_to_widxord: numpy array
         Link between wvidx (word2vec_index) and widxord (word_index_ord)
         for the number of occurences calculation for sentence2vec
 
-    embedding_matrix:
-        vector corresponding to word with index wvidx
-        wvidx is a specific word2vec index
+    embedding_matrix: 2D numpy array
+        Matrix of vectors representing the embeddings for each word,
+        which are indexed as wvidx, a specific word2vec index
     """
 
     def __init__(self,
@@ -874,9 +933,8 @@ class create_index():
         self.size_sindex = 500000000
 
         # Model files
-        self.allvocab_to_widxord = {}
         self.idx_to_filename = {}
-        self.widx_to_cumcount = None
+        self.widxord_to_cumcount = None
         self.pag_breaks = []
         self.doc_breaks = []
 
@@ -960,7 +1018,7 @@ class create_index():
 
         Will save the temporary_inverted.npy and temporary_count.npy
         files on the disk, as well as doc_breaks.npy, pag_breaks.npy,
-        idx_to_filename.pkl, widx_to_cumcount.npy and
+        idx_to_filename.pkl, widxord_to_cumcount.npy and
         allvocab_to_widxord.pkl
 
         All model files will be saved in {self.root_folder}/models/
@@ -1127,7 +1185,9 @@ class create_index():
         # The size of full_inverted.npy is capped by size_sindex
         # This is mostly a reordering/defragmentation of the temporary objects
         used_mem = 0
-        for full_inv_idx, (idx_a, idx_b) in enumerate(mem_batches):
+        full_inv_idx = 0
+        for (idx_a, idx_b) in mem_batches:
+            full_inv_idx += 1
             # Identifying the cumulative counts of the words for the current
             # batch
             if idx_a == 0:
@@ -1248,7 +1308,7 @@ class create_index():
         Creates wvvocab_to_wvidx.pkl, wvidx_to_widxord.npy and
         embedding_matrix.npy.
 
-        Uses self.allvocab_to_widxord generated from import_documents()
+        Uses self.allvocab_to_widx generated from import_documents()
 
         All model files will be saved in {self.root_folder}/models/
 
@@ -1511,42 +1571,142 @@ class create_index():
         self.sentence2vec()
 
 
-class query():
+class query_object():
     """
     Parameters
     ----------
-        root_folder
-        
-        word_dictionaires: need keys for all available languages (even if dictionaries are empty)
-        
-        default_lang: 
+    root_folder: str, optional
+        Path to the main repository of the analysis, where model files
+        and outputs will be saved.
+        Default is '', which is current working directory.
+
+    word_dictionaries: dict of str: set of str, optional
+        Each dictionary (in the values of the object) is a set of strings
+        containing all dictionary words for a specific language.
+        Languages are identified by a 2-letters string (in the keys of the
+        object) which are the results of the
+        googletrans.Translator().detect().lang function.
+        Dictionaries are used for filtering the gibberish from the pdf texts
+        and recognize language.
+        If None/empty, will not use those functionalities.
+        Default is None.
+
+    default_lang: str, optional
+        Default language of the dictionaries. Corresponds to a key of the
+        word_dictionaries object to default to if the language
+        recognition fails.
+        If None or empty, no dictionary will be used if the language
+        recognition fails.
+        Default is None.
 
     Attributes
     ----------
-        idx_to_filename.pkl
-        pag_breaks.npy
-        doc_breaks.npy
-        hyper_params.pkl
-        allvocab_to_widxord.pkl
-        widxord_to_cumcount.npy
-        full_inverted[X].npy
-        page_vectors[X].npy
-        wvvocab_to_wvidx.pkl
-        wvidx_to_widxord.npy
-        embedding_matrix.npy
-        pca_component.npy
-            
-        filename_to_idx
-        size_accessload: Parameter to optimize speed of importing page_vectors and calculating cosine similarity
-        full_inverted_memmaps
-        page_vectors_memmaps
-        pca_component
-        
-        stopwords_keys
+    text_treatment: text_treatment()
+        text_treatment() class object containing word dictionaries
+        for filtering text when reading.
+
+    allvocab_to_widxord: dict of {str: int}
+        Dictionary where the key is the string of a word in the corpus,
+        and the value (word index) is an int index identifying the word.
+        The index ordered by descending word count (widx_ord)
+        The exact type of the value is identified via self.type_word
+
+    idx_to_filename: dict of {int: str}
+        Dictionary where the key is an index representing a document
+        in the database, and the value is the string of the file name
+        of the document
+
+    filename_to_idx: dict of {str: int}
+        Inversion of idx_to_filename
+        Dictionary where the key is the string of the file name
+        of the document, and the value is an index representing a document
+        in the database.
+
+    pag_breaks: list of int
+        List of the index of words (self.sidx) corresponding to the
+        beginning of a new page
+
+    doc_breaks: list of int
+        List of the index of words (self.sidx) corresponding to the
+        beginning of a new page.
+        Will eventually be transformed in the list of page numbers instead
+        of word indexes.
+
+    type_word: str
+        Type of the word index encoding. If the number of distinct words
+        tokens in the corpus is under 65535 (small corpuses), it should
+        be 'u2'. If not, 'u4' (with an upper limit of 4294967295)
+        Imported through hyper_params.pkl
+
+    type_invidx: str
+        Type of the inverted index self.sidx encoding. Normally 'u4'.
+        If the whole corpus is more than 4294967295 words
+        (approximately 16 Gb), should be changed for 'u8'.
+        The implementation of 'u8' was never tested.
+        Imported through hyper_params.pkl
+
+    embedding_size: int
+        Dimension size of the word embeddings.
+        Imported through hyper_params.pkl
+
+    size_sindex: int
+        Variable limiting the size of the objects saved on the hard drive
+        for the use of numpy memmap functions on older systems.
+        32-bit systems cannot support numpy memmap on object bigger
+        than 2 Gb, so size_sindex should not be higher than 500M
+        (times type_invidx = 'u4' which equals 2 Gb)
+        Imported through hyper_params.pkl
+
+    widxord_to_cumcount:  numpy array
+        Cumulative count of all words, ordered by descending word count.
+        The word count of a word corresponding to index widx_ord is
+        widxord_to_cumcount[widx_ord] - widxord_to_cumcount[widx_ord-1]
+
+    wvvocab_to_wvidx: dict of {str:int}
+        Dictionary where key=word string, where the word
+        occurences > min_word_count specified in the word2vec calculation,
+        and value=wvidx, word2vec_index an index corresponding to the
+        embedding
+
+    wvidx_to_widxord: numpy array
+        Link between wvidx (word2vec_index) and widxord (word_index_ord)
+        for the number of occurences calculation for sentence2vec
+
+    embedding_matrix: 2D numpy memmap
+        Numpy memory map pointing to the hard drive location of the
+        matrix of vectors representing the embeddings for each word,
+        which are indexed as wvidx, a specific word2vec index
+
+    full_inverted_memmaps: dict of {str: 2D numpy memmap}
+        Dictionary where key=file name (with extension) of the inverted
+        index ('full_inverted{X}.npy'), and the value is the
+        numpy memory map pointing to the hard drive location of the
+        inverted index used for word searched.
+
+    page_vectors_memmaps: list of 2D numpy memmap
+        List where the index if the integer {X} corresponding to the
+        'page_vectors{X}.npy' model files, and the objects are
+        numpy memory map pointing to the hard drive location of the
+        specified page_vectors.npy object containing sentence2vec
+        embeddings of pages of the corpus
+
+    pca_component: numpy array
+        The main PCA component of the page sentence2vec raw embeddings,
+        to compute the corrected sentence2vec embeddings
+
+    size_accessload: int
+        Parameter to optimize speed of importing page_vectors and calculating
+        cosine similarity. Correspond to the number of vectors on which to do
+        simultaneous cosine similarity in a single matrix. Good performance
+        results are obtained for value of 100000.
+
+    stopwords_keys: dict of {str: str}
+        Corresponding language string between word_dictionaries object
+        (from googletrans module) and stopwords modules from nltk.
     """
 
     def __init__(self,
-                 root_folder,
+                 root_folder='',
                  word_dictionaries=None,
                  default_lang=None):
         self.root_folder = root_folder
@@ -1648,15 +1808,39 @@ class query():
                           n_results):
         """
         Generates a text string of all answers to output in a .csv format
-        
+
         Parameters
         ----------
-        answers:
-        n_results:
-            (outputs of retrieve_closest_passages) TO COMPLETE 
-            
+        answers: List of (List of int)*3
+            The first object as outputted by retrieve_closest_passage().
+            This first object is a nested list of the index of results.
+            Each item [n] in the list contains all results from the most
+            relevant collective agreement, in order of relevance.
+            Each item contains 3 lists:
+            [n][0]: The 1-length list of the most relevant result of this
+                    particular collective agreement
+            [n][1]: Every other possible relevent results in this particular
+                    collective agreement (that matches words from the query)
+                    in order of relevance
+            [n][2]: All other results in the collective agreement
+                    -including irrelevant ones-  in order of relevance.
+
+        n_results: List of (int)*3
+            The second object as outputted by retrieve_closest_passage().
+            This second object is a list with the numbers of results.
+            [0]: Number of results including all words of the query
+            [1]: Number of results including at least one word of the query
+            [2]: Number of documents in the database
+                 (potential maximum number of results)
+
+        Returns
+        -------
+        str
+            Data to be exported in .csv format, containing the
+            results in two column, the first being the filename
+            of the document, the second being the page number
         """
-        output_data = 'Collective agreement number,Page numbers'
+        output_data = 'File name,Page numbers'
         for ans in answers[:n_results[0]]:
             doc_idx = bisect_right(self.doc_breaks, ans[0][0])-1
             lin = (self.idx_to_filename[doc_idx] + ',' +
@@ -1746,7 +1930,7 @@ class query():
 
         Returns
         -------
-            numpy array
+        numpy array
             Vector of the embedding of the sentence
         """
         a = 1e-3
@@ -1913,11 +2097,29 @@ class query():
                                   time_flag=False):
         """
         Returns the results (pages) in the corpus that match the query.
-        
-        Uses SOMETHING (word match, then cosine similarity) TO COMPLETE 
-        
-        Quotation marks means exact expression
-        
+
+        A query string can include quotation marks to signify an exact
+        expression comprised of multiple work tokens.
+
+        Each possible result (pages, in that case) are grouped together
+        per document. Each document will be ranked according to
+        its best result (page). Each result is attributed two metrics:
+        a) the amount of word token (excluding common stopwords)
+           that are textually present in the result
+        b) the cosine similarity between the sentence2vec
+           embeddings (with main component of PCA taken off) of the
+           query and the result.
+        Each possible result is ordered by a), and THEN b).
+        Then, for convenience, all other possible results (pages) from the
+        document are ordered through the same process. Therefore, it is easy
+        to access other pages/results from the documents with the top overall
+        match with the query.
+        More comments related to how the sorting is done below.
+
+        NOTE: The bottleneck of this code is NOT the calculation of cosine
+        similarities with all pages in the database, but rather the
+        ordering of the results.
+
         Uses attributes doc_breaks, pag_breaks, idx_to_filename,
         filename_to_idx, full_inverted_memmaps, page_vectors_memmaps
         widxord_to_cumcount,
@@ -2044,7 +2246,7 @@ class query():
                 if i % 2 == 0:
                     if list_lang[j]:
                         stopwords_set_trans = set(stopwords.words(
-                            self.stopwords_keys(list_lang[j])
+                            self.stopwords_keys[list_lang[j]]
                             ))
                     else:
                         stopwords_set_trans = {}
@@ -2089,7 +2291,7 @@ class query():
                                   ('order', self.type_invidx),
                                   ('grep', 'f4'),
                                   ('distance', 'f4')])
-        results['page'] = np.arange(len(self.ag_breaks))
+        results['page'] = np.arange(len(self.pag_breaks))
         docs = -np.ones(len(self.pag_breaks), dtype=self.type_invidx)
 
         for doc in doc_list:
@@ -2116,15 +2318,15 @@ class query():
         size_page = self.size_sindex//self.embedding_size
         for pvidx, page_vectors in enumerate(self.page_vectors_memmaps):
             mem_batches = ([i*self.size_accessload
-                            for i in range((len(self.page_vectors) - 1) //
+                            for i in range((len(page_vectors) - 1) //
                                            self.size_accessload + 1)] +
-                           [len(self.page_vectors)])
+                           [len(page_vectors)])
             for i in range(len(mem_batches)-1):
                 idx_a = mem_batches[i]
                 idx_b = mem_batches[i+1]
                 for j, query_vect_trans in enumerate(list_query_vect):
                     dist[j][pvidx*size_page+idx_a:pvidx*size_page+idx_b] = \
-                        self.page_vectors[idx_a:idx_b].dot(query_vect_trans)
+                        page_vectors[idx_a:idx_b].dot(query_vect_trans)
 
         results['distance'] = dist.max(axis=0)
         # Freeing memory
@@ -2213,9 +2415,10 @@ class query():
         query : str
             The query in string format.
 
-        answers : List of (List of int)*3
-            the output, or a subset of the output,
-            of retrieve_closest_passages(query, from_pdfs)
+        answers : List of int
+            The list of answers page indexes as returned by
+            retrieve_closest_passages(query, from_pdfs),
+            but in a single list
 
         num_answers : int, optional
             Number of displayed answers.
@@ -2229,20 +2432,23 @@ class query():
 
         Returns
         -------
-        List of [str, str, List of (int, int)]
-            Each individual item of the returned object is a result.
-            Each item [n] of the list contains:
-                [n][0] the string of the code of the answer (pdf_name-page_number) 
-                [n][1] the plain text of the answer
-                [n][2] the list of pairs of characters to highlight in the
-                results - from the text [n][1], you need to highlight all
-                characters [n][2][k][0]:[n][2][k][1] for all k in [n][2].
+        List of (str, str, List of [int, int])
+            Each object of the list is the three elements of a result
+            [n][0]: The name of the document/answer in format
+                    [filename]-[page number]
+            [n][1]: Raw textual data of the page containing the answer,
+                    obtained from the .pkl of the pdf
+            [n][2]: List of (int, int) corresponding to the index pairs
+                    (i_start, i_stop) of text to highlight in a UI display,
+                    which should be the location of the word token included
+                    in the query.
+                    The indexes should be used as text[i_start:i_strop]
         """
 
         if num_answers is None:
             num_answers = len(answers)
 
-        # QUery
+        # Query treatment
         # Clean quotation marks format
         for c in '“”«»':
             query = query.replace(c, '"')
@@ -2266,7 +2472,7 @@ class query():
                     self.text_treatment.translator.translate(
                         query[:5000], dest=dest).text)
                 list_lang.append(dest)
-    
+
         metalist = []
         for pag in answers[:num_answers]:
             doc_idx = bisect_right(self.doc_breaks, pag) - 1
@@ -2275,9 +2481,9 @@ class query():
 
         textCA = []
         for pdf in pdflist:
-            fname = self.root_folder + self.idx_to_filename[pdf]+'.pkl'
+            fname = self.idx_to_filename[pdf]+'.pkl'
             pages_text = pickle.load(
-                open(Path(self.pkl_folder) / fname, 'rb')
+                open(Path(self.root_folder) / 'txt-pdftotext' / fname, 'rb')
                 )
             if pages_text:
                 textCA.append(self.text_treatment.format_txt(pages_text))
@@ -2293,12 +2499,12 @@ class query():
                 # function's bottleneck
                 if trans_flag:
                     lang_scores = [0]*len(list_query)
-                    for j, query_trans in list_query:
+                    for j, query_trans in enumerate(list_query):
                         w_list = cleanpassage(query_trans).split()
                         for word in w_list:
                             if list_lang[j]:
                                 stopwords_set_trans = set(stopwords.words(
-                                    self.stopwords_keys(list_lang[j])
+                                    self.stopwords_keys[list_lang[j]]
                                     ))
                             else:
                                 stopwords_set_trans = {}
@@ -2311,7 +2517,7 @@ class query():
                     max_idx = [i for i, s in enumerate(lang_scores)
                                if s == max(lang_scores)]
                     if len(max_idx) == 1:
-                        text_lang = list_lang[max_idx]
+                        text_lang = list_lang[max_idx[0]]
                     else:
                         text_lang = self.text_treatment.translator.detect(
                             cleantext[:5000]
@@ -2340,7 +2546,7 @@ class query():
                 query_words = []
                 if text_lang:
                     stopwords_set_trans = set(stopwords.words(
-                        self.stopwords_keys(text_lang)
+                        self.stopwords_keys[text_lang]
                         ))
                 else:
                     stopwords_set_trans = {}
@@ -2358,7 +2564,8 @@ class query():
                     highlight_pos += ngram_positions(word, cleantext)
                 highlight_pos = fuse_positions(highlight_pos)
                 for i in range(len(highlight_pos)):
-                    highlight_pos[i] = span_shift(highlight_pos[i])
+                    highlight_pos[i] = span_shift(highlight_pos[i],
+                                                  cleantext)
             results.append([self.idx_to_filename[meta[0]]+'-%i' % meta[1],
                             text,
                             highlight_pos])
@@ -2369,51 +2576,28 @@ if __name__ == '__main__':
     # Treatment of pdftotext on the pdf folder
     # PT = pdf_treatment(exec_path='xpdf-tools-mac-4.02/bin64/')
     # PT.pdftotext('test_data/pdfs/')
-    """
-    filename = 'test_data/txt-pdftotext/1512101c.pkl'
-    if filename.split('.')[-1] == 'pkl':
-        pages_text = pickle.load(open(filename, 'rb'))
-    elif filename.split('.')[-1] == 'txt':
-        with open(filename) as f:
-            pages_text = [f.read()]
-    else:
-        raise NameError('filetype introuvable')
-
-    CI = create_index()
-    a = CI.format_txt(pages_text)
-    """
 
     # Dictionaries import
+    word_dictionaries = import_dictionaries()
 
-    # English
-    try:
-        import json
-        filename = "words_dictionary.json"
-        with open(filename, "r") as english_dictionary:
-            valid_words = json.load(english_dictionary)
-            english_words = valid_words.keys()
-    except Exception as e:
-        print(str(e))
+    # Creating index
+    """
+    CI = create_index('test_data/txt-pdftotext',
+                      word_dictionaries=word_dictionaries,
+                      default_lang='en')
+    CI.compute()
+    """
 
-    # French
-    try:
-        filename = "liste.de.mots.francais.sansaccents.txt"
-        with open(filename, "r") as french_dictionnary:
-            data = french_dictionnary.read()
-        valid_words = dict((el, 0) for el in data.split('\n'))
-        french_words = valid_words.keys()
-    except Exception as e:
-        print(str(e))
-
-    word_dictionaries = {'en': english_words,
-                         'fr': french_words}
-
-    #CI = create_index('test_data/txt-pdftotext',
-    #                  word_dictionaries=word_dictionaries,
-    #                  default_lang='en')
-    #CI.compute()
-    
-    Q = query('test_data',
-              word_dictionaries=word_dictionaries,
-              default_lang='en')
-
+    Q = query_object('test_data',
+                     word_dictionaries=word_dictionaries,
+                     default_lang='en')
+    query = 'présente convention'
+    answers_rich, n_results = Q.retrieve_closest_passages(query)
+    answers = [a[0][0] for a in answers_rich]
+    results = Q.print_closest_passages(query, answers, num_answers=10)
+    for filecode, text, highlight_pos in results:
+        print(filecode)
+        print()
+        for i_start, i_stop in highlight_pos:
+            print(text[i_start:i_stop])
+        print()
